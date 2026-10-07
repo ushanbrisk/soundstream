@@ -5,6 +5,24 @@ from torch.nn.utils import weight_norm
 
 from vector_quantize_pytorch import ResidualVQ
 
+# Monkey-patch EuclideanCodebook.forward to enforce fp32 in the codebook
+# hot path. vector_quantize_pytorch decorates EuclideanCodebook.forward
+# with @autocast(enabled=False), but the wrapper relies on the global
+# autocast state being respected. DeepSpeed's BF16 optimizer plus various
+# autocast interactions leave cdist seeing a bf16 activation against an
+# fp32 codebook (or vice versa), raising:
+#   RuntimeError: expected scalar type BFloat16 but found Float
+# Force both sides to fp32 right at the codebook boundary.
+import vector_quantize_pytorch.vector_quantize_pytorch as _vq_mod
+_orig_codebook_forward = _vq_mod.EuclideanCodebook.forward
+
+def _safe_codebook_forward(self, x):
+    if hasattr(self, 'embed') and self.embed.dtype != torch.float32:
+        self.embed.data = self.embed.data.float()
+    return _orig_codebook_forward(self, x)
+
+_vq_mod.EuclideanCodebook.forward = _safe_codebook_forward
+
 # Generator
 
 
@@ -157,8 +175,21 @@ class SoundStream(nn.Module):
         e = self.encoder(x)  # (B, D, T)
         e = e.transpose(1, 2) # (B, T, D)
 
-        quantized, _, _ = self.quantizer(e)
-        quantized = quantized.transpose(1, 2)  # (B, D, T)
+        # ResidualVQ (vector_quantize_pytorch) does not support bf16 reliably:
+        # its internal kmeans init and torch.cdist on embeddings assume fp32.
+        # Cast the path through the quantizer back to fp32, then restore bf16
+        # for the decoder.
+        #
+        # DeepSpeed's bf16 autocast wraps the entire model forward at the
+        # engine level (independent of bf16.exclude_modules, which only
+        # controls parameter dtype in BF16_Optimizer). Inside autocast,
+        # EuclideanCodebook's `embed` parameter gets cast to bf16 for the
+        # cdist op while the input stays fp32, causing a dtype mismatch.
+        # Disabling autocast here forces the whole ResidualVQ subtree to
+        # run in pure fp32; encoder/decoder above/below remain bf16.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            quantized, _, _ = self.quantizer(e.float())
+        quantized = quantized.to(e.dtype).transpose(1, 2)  # (B, D, T)
         o = self.decoder(quantized)
         return o
 
